@@ -7,27 +7,35 @@
 // CONFIGURACIÓN GENERAL
 // =====================================================
 
-#define I2C_SDA 21
-#define I2C_SCL 22
+// ESP8266 NodeMCU / Wemos D1 mini:
+// GPIO4 = D2 = SDA
+// GPIO5 = D1 = SCL
+#define I2C_SDA 4
+#define I2C_SCL 5
 #define I2C_FREQ_HZ 50000
 
 #define SCD30_INTERVAL_S 5
 #define SENSOR_POLL_MS 1000
 #define SENSOR_TIMEOUT_MS 15000
-
 #define CLOUD_UPDATE_MS 5000
+#define SENSOR_RETRY_MS 5000
 
 // El gas se diluye 1:50 antes de llegar al SCD30.
 #define DILUTION_FACTOR 50.0
 
-// Límite superior aproximado del SCD30.
-// Si la lectura se acerca a este valor, el CO2 real puede estar en el límite superior.
+// El SCD30 mide aproximadamente hasta 10000 ppm.
+// Se usa este umbral para detectar lectura cercana al límite.
 #define SCD30_SATURATION_PPM 9800.0
 
 SCD30 airSensor;
 
-QueueHandle_t sensorQueue;
-volatile bool scd30Ready = false;
+bool scd30Ready = false;
+bool hasLatestData = false;
+
+uint32_t lastSensorPoll = 0;
+uint32_t lastValidRead = 0;
+uint32_t lastCloudUpdate = 0;
+uint32_t lastSensorRetry = 0;
 
 // =====================================================
 // ESTRUCTURA LOCAL DE DATOS
@@ -47,6 +55,8 @@ struct ReactorData {
 
   char state[60];
 };
+
+ReactorData latestData;
 
 // =====================================================
 // FUNCIONES AUXILIARES
@@ -92,10 +102,6 @@ void evaluateReactorState(ReactorData &data) {
     return;
   }
 
-  // -------------------------------
-  // Evaluación por temperatura
-  // -------------------------------
-
   bool tempOptimal = false;
   bool tempWarning = false;
   bool tempCritical = false;
@@ -130,10 +136,6 @@ void evaluateReactorState(ReactorData &data) {
     return;
   }
 
-  // -------------------------------
-  // Evaluación por gases
-  // -------------------------------
-
   bool gasNormal = false;
   bool gasWarning = false;
   bool gasObservation = false;
@@ -149,15 +151,9 @@ void evaluateReactorState(ReactorData &data) {
     gasWarning = true;
   }
 
-  // El sensor está cerca del límite máximo.
-  // Con factor 50, 9800 ppm equivalen a 49 % de CO2 estimado.
   if (data.co2SensorPpm >= SCD30_SATURATION_PPM) {
     gasObservation = true;
   }
-
-  // -------------------------------
-  // Estado combinado del reactor
-  // -------------------------------
 
   if (tempOptimal && gasNormal) {
     if (data.co2SensorPpm >= SCD30_SATURATION_PPM) {
@@ -219,6 +215,11 @@ bool initSCD30() {
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(I2C_FREQ_HZ);
 
+#ifdef ESP8266
+  // Ayuda con sensores I2C que pueden requerir clock stretching.
+  Wire.setClockStretchLimit(200000);
+#endif
+
   if (!airSensor.begin()) {
     Serial.println("SCD30 no detectado por I2C.");
     scd30Ready = false;
@@ -231,114 +232,128 @@ bool initSCD30() {
   airSensor.setAutoSelfCalibration(true);
 
   scd30Ready = true;
+  lastValidRead = millis();
 
   Serial.println("SCD30 inicializado con autocalibracion activada.");
   return true;
 }
 
 // =====================================================
-// ACTUALIZACIÓN DE VARIABLES DE ARDUINO CLOUD
+// ERROR DEL SENSOR
 // =====================================================
 
-void updateCloudVariables(const ReactorData &data) {
-  co2SensorPpm = data.co2SensorPpm;
-  co2CorrectedPpm = data.co2CorrectedPpm;
-  co2Percent = data.co2Percent;
-  ch4Percent = data.ch4Percent;
+void setSensorError() {
+  latestData.co2SensorPpm = 0.0;
+  latestData.co2CorrectedPpm = 0.0;
+  latestData.co2Percent = 0.0;
+  latestData.ch4Percent = 0.0;
+  latestData.temperatureC = -127.0;
+  latestData.humidityPercent = 0.0;
+  latestData.sensorOk = false;
 
-  temperatureC = data.temperatureC;
-  humidityPercent = data.humidityPercent;
+  evaluateReactorState(latestData);
 
-  reactorState = String(data.state);
-  alertLevel = data.alertLevel;
-  sensorOk = data.sensorOk;
-  alarmActive = data.alarmActive;
+  hasLatestData = true;
 }
 
 // =====================================================
-// TAREA FREERTOS: LECTURA DEL SENSOR
+// LECTURA DEL SENSOR
 // =====================================================
 
-void taskSensor(void *parameter) {
-  uint32_t lastValidRead = millis();
-  uint32_t lastErrorReport = 0;
+void readSCD30IfAvailable() {
+  if (!scd30Ready) {
+    if (millis() - lastSensorRetry >= SENSOR_RETRY_MS) {
+      lastSensorRetry = millis();
 
-  for (;;) {
-    if (!scd30Ready) {
-      initSCD30();
-
-      if (!scd30Ready && millis() - lastErrorReport >= 5000) {
-        ReactorData errorData = {};
-
-        errorData.co2SensorPpm = 0.0;
-        errorData.co2CorrectedPpm = 0.0;
-        errorData.co2Percent = 0.0;
-        errorData.ch4Percent = 0.0;
-        errorData.temperatureC = -127.0;
-        errorData.humidityPercent = 0.0;
-        errorData.sensorOk = false;
-
-        evaluateReactorState(errorData);
-        xQueueOverwrite(sensorQueue, &errorData);
-
-        lastErrorReport = millis();
+      if (!initSCD30()) {
+        setSensorError();
       }
-
-      vTaskDelay(pdMS_TO_TICKS(5000));
-      continue;
     }
 
-    if (airSensor.dataAvailable()) {
-      ReactorData data = {};
-
-      data.co2SensorPpm = airSensor.getCO2();
-      data.temperatureC = airSensor.getTemperature();
-      data.humidityPercent = airSensor.getHumidity();
-
-      data.co2CorrectedPpm = estimateCO2CorrectedPpm(data.co2SensorPpm);
-      data.co2Percent = estimateCO2Percent(data.co2SensorPpm);
-      data.ch4Percent = estimateCH4Percent(data.co2Percent);
-
-      data.sensorOk = true;
-
-      evaluateReactorState(data);
-
-      xQueueOverwrite(sensorQueue, &data);
-
-      lastValidRead = millis();
-
-      Serial.print("CO2 sensor ppm: ");
-      Serial.print(data.co2SensorPpm);
-
-      Serial.print(" | CO2 corregido ppm: ");
-      Serial.print(data.co2CorrectedPpm);
-
-      Serial.print(" | CO2 %: ");
-      Serial.print(data.co2Percent, 2);
-
-      Serial.print(" | CH4 %: ");
-      Serial.print(data.ch4Percent, 2);
-
-      Serial.print(" | Temp C: ");
-      Serial.print(data.temperatureC, 2);
-
-      Serial.print(" | HR %: ");
-      Serial.print(data.humidityPercent, 2);
-
-      Serial.print(" | Estado: ");
-      Serial.print(data.state);
-
-      Serial.print(" | Alerta: ");
-      Serial.println(data.alertLevel);
-    }
-
-    if (millis() - lastValidRead > SENSOR_TIMEOUT_MS) {
-      scd30Ready = false;
-      Serial.println("Timeout del SCD30. Se intentara reinicializar.");
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(SENSOR_POLL_MS));
+    return;
   }
+
+  if (millis() - lastSensorPoll < SENSOR_POLL_MS) {
+    return;
+  }
+
+  lastSensorPoll = millis();
+
+  if (airSensor.dataAvailable()) {
+    latestData.co2SensorPpm = airSensor.getCO2();
+    latestData.temperatureC = airSensor.getTemperature();
+    latestData.humidityPercent = airSensor.getHumidity();
+
+    latestData.co2CorrectedPpm = estimateCO2CorrectedPpm(latestData.co2SensorPpm);
+    latestData.co2Percent = estimateCO2Percent(latestData.co2SensorPpm);
+    latestData.ch4Percent = estimateCH4Percent(latestData.co2Percent);
+
+    latestData.sensorOk = true;
+
+    evaluateReactorState(latestData);
+
+    hasLatestData = true;
+    lastValidRead = millis();
+
+    Serial.print("CO2 sensor ppm: ");
+    Serial.print(latestData.co2SensorPpm);
+
+    Serial.print(" | CO2 corregido ppm: ");
+    Serial.print(latestData.co2CorrectedPpm);
+
+    Serial.print(" | CO2 %: ");
+    Serial.print(latestData.co2Percent, 2);
+
+    Serial.print(" | CH4 %: ");
+    Serial.print(latestData.ch4Percent, 2);
+
+    Serial.print(" | Temp C: ");
+    Serial.print(latestData.temperatureC, 2);
+
+    Serial.print(" | HR %: ");
+    Serial.print(latestData.humidityPercent, 2);
+
+    Serial.print(" | Estado: ");
+    Serial.print(latestData.state);
+
+    Serial.print(" | Alerta: ");
+    Serial.println(latestData.alertLevel);
+  }
+
+  if (millis() - lastValidRead > SENSOR_TIMEOUT_MS) {
+    Serial.println("Timeout del SCD30. Se intentara reinicializar.");
+    scd30Ready = false;
+    setSensorError();
+  }
+}
+
+// =====================================================
+// ACTUALIZACIÓN DE VARIABLES DE ARDUINO CLOUD
+// =====================================================
+
+void updateCloudVariables() {
+  if (!hasLatestData) {
+    return;
+  }
+
+  if (millis() - lastCloudUpdate < CLOUD_UPDATE_MS) {
+    return;
+  }
+
+  lastCloudUpdate = millis();
+
+  co2SensorPpm = latestData.co2SensorPpm;
+  co2CorrectedPpm = latestData.co2CorrectedPpm;
+  co2Percent = latestData.co2Percent;
+  ch4Percent = latestData.ch4Percent;
+
+  temperatureC = latestData.temperatureC;
+  humidityPercent = latestData.humidityPercent;
+
+  reactorState = String(latestData.state);
+  alertLevel = latestData.alertLevel;
+  sensorOk = latestData.sensorOk;
+  alarmActive = latestData.alarmActive;
 }
 
 // =====================================================
@@ -349,15 +364,6 @@ void setup() {
   Serial.begin(115200);
   delay(1500);
 
-  sensorQueue = xQueueCreate(1, sizeof(ReactorData));
-
-  if (sensorQueue == NULL) {
-    Serial.println("Error creando cola de datos.");
-    while (true) {
-      delay(1000);
-    }
-  }
-
   initProperties();
 
   ArduinoCloud.begin(ArduinoIoTPreferredConnection);
@@ -366,16 +372,6 @@ void setup() {
   ArduinoCloud.printDebugInfo();
 
   initSCD30();
-
-  xTaskCreatePinnedToCore(
-    taskSensor,
-    "TaskSensor",
-    4096,
-    NULL,
-    2,
-    NULL,
-    1
-  );
 }
 
 // =====================================================
@@ -385,16 +381,8 @@ void setup() {
 void loop() {
   ArduinoCloud.update();
 
-  static uint32_t lastCloudUpdate = 0;
-  static ReactorData latestData;
-
-  if (millis() - lastCloudUpdate >= CLOUD_UPDATE_MS) {
-    if (xQueuePeek(sensorQueue, &latestData, 0) == pdTRUE) {
-      updateCloudVariables(latestData);
-    }
-
-    lastCloudUpdate = millis();
-  }
+  readSCD30IfAvailable();
+  updateCloudVariables();
 
   delay(10);
 }
